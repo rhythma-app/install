@@ -1,0 +1,177 @@
+# One Rhythma Instance.
+#
+# Published by the release job, fetched by the installer, and replaced wholesale by
+# `rhythma update` — a new version may add a service, so this file travels with its images
+# rather than being frozen at install time. Nothing here is meant to be hand-edited; the
+# knobs are in `.env` beside it.
+#
+# The proxy is the only published port. Everything else talks over the compose network, which
+# is what lets an operator put one upstream in their own reverse proxy and be done (ADR-0009).
+name: rhythma
+
+services:
+    postgres:
+        image: timescale/timescaledb:2.29.2-pg18
+        restart: unless-stopped
+        environment:
+            POSTGRES_USER: rhythma
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            POSTGRES_DB: rhythma
+        volumes:
+            # A bind mount, not a named volume: an operator has to be able to answer "where is
+            # my data" without knowing where Docker keeps volumes.
+            #
+            # `/var/lib/postgresql`, not `/var/lib/postgresql/data`. Postgres 18's image moved
+            # the recommended mount up one level so `pg_upgrade --link` is not fighting a mount
+            # boundary, and it refuses to start against a fresh data directory mounted the old
+            # way — which is every install there has ever been. `apps/releases` was moved to
+            # pg18 with this already right; this file was moved with it and was not.
+            - ./data/postgres:/var/lib/postgresql
+        healthcheck:
+            # `-h 127.0.0.1`, not the unix socket. While the image initialises a fresh
+            # data directory it runs a temporary server with `listen_addresses=''` — reachable
+            # over the socket and not over TCP — so a socket-based `pg_isready` reports healthy
+            # against a server that is about to be shut down and restarted. Everything here
+            # connects over TCP, so it gets `ECONNRESET` on its first query, which is how 22
+            # api tests failed at `CREATE SCHEMA` in CI on a run that had passed before.
+            test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U rhythma -d rhythma']
+            interval: 10s
+            timeout: 5s
+            retries: 12
+
+    minio:
+        image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+        restart: unless-stopped
+        environment:
+            MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID}
+            MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY}
+        command: server /data
+        volumes:
+            - ./data/minio:/data
+        healthcheck:
+            test: ['CMD-SHELL', 'mc ready local || exit 1']
+            interval: 10s
+            timeout: 5s
+            retries: 12
+
+    # The two watch builds, which are files and not a server.
+    #
+    # It runs once per `up`, copies this version's APKs into a volume and exits. That is the
+    # only way an image's contents can be handed to another container, and it is how they reach
+    # `api` — which serves the app to enrolled agents and the agent to a bench holding an
+    # enrolment token, so that no watch and no laptop ever holds a registry credential
+    # (ADR-0014). `RHYTHMA_VERSION` names the *image* exactly as it names every other
+    # (ADR-0011), so `rhythma update` moves the fleet's target and the bytes together. What is
+    # inside it is the two build versions this release ships, which are different strings
+    # (ADR-0016) and are why `WEAR_APP_VERSION` and `FLEET_AGENT_VERSION` are passed to `api`
+    # below rather than derived here.
+    apk:
+        image: ${RHYTHMA_REGISTRY}/wear-apk:${RHYTHMA_VERSION}
+        command: ['cp', '/wear-app.apk', '/fleet-agent.apk', '/srv/']
+        volumes:
+            - wear-apk:/srv
+
+    api:
+        image: ${RHYTHMA_REGISTRY}/api:${RHYTHMA_VERSION}
+        restart: unless-stopped
+        environment:
+            DATABASE_URL: postgres://rhythma:${POSTGRES_PASSWORD}@postgres:5432/rhythma
+            BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+            # Both derived from the one question the installer asks.
+            BETTER_AUTH_URL: ${RHYTHMA_URL}
+            TRUSTED_ORIGINS: ${RHYTHMA_URL}
+            NODE_ENV: production
+            BACKEND_VERSION: ${RHYTHMA_VERSION}
+            # Which watch builds this release ships, which are not this release's version.
+            #
+            # A watch build moves only when its own source changed (ADR-0016), so an assembly
+            # ordinarily ships an older app — and an Instance that answered its own version here
+            # would tell every watch to install a build nobody made, once per check-in, forever.
+            # Written into `.env` by the installer and by `rhythma update`, from the `builds.env`
+            # published beside this file.
+            WEAR_APP_VERSION: ${WEAR_APP_VERSION}
+            FLEET_AGENT_VERSION: ${FLEET_AGENT_VERSION}
+            S3_ENDPOINT: http://minio:9000
+            S3_BUCKET: rhythma-exports
+            S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+            S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+            WEAR_APK_PATH: /srv/wear-app.apk
+            # The agent, from the same volume and served on a different route to a different
+            # credential (ADR-0014). Named outright rather than found in a directory: a path is
+            # an endpoint and a credential, and a folder that something listed could quietly
+            # start including a third file.
+            FLEET_AGENT_APK_PATH: /srv/fleet-agent.apk
+            # What this Instance may install, and who it is. Both written by the installer from
+            # the one licence an operator was given; the licence is carried and displayed here
+            # and verified only by the service that minted it (ADR-0013).
+            RELEASE_SERVICE_URL: ${RELEASE_SERVICE_URL}
+            RHYTHMA_LICENCE: ${RHYTHMA_LICENCE}
+        volumes:
+            - wear-apk:/srv:ro
+        depends_on:
+            postgres:
+                condition: service_healthy
+            minio:
+                condition: service_healthy
+            apk:
+                condition: service_completed_successfully
+                # An Instance with no watch build is a working Instance: watches keep
+                # collecting, keep checking in, and are offered nothing to install. Making
+                # this required would let one unpullable artifact take the whole product down.
+                required: false
+        healthcheck:
+            test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/api/auth/ok || exit 1']
+            interval: 10s
+            timeout: 10s
+            retries: 24
+
+    realtime:
+        image: ${RHYTHMA_REGISTRY}/realtime:${RHYTHMA_VERSION}
+        restart: unless-stopped
+        environment:
+            DATABASE_URL: postgres://rhythma:${POSTGRES_PASSWORD}@postgres:5432/rhythma
+            PORT: 3001
+        depends_on:
+            postgres:
+                condition: service_healthy
+
+    exporter:
+        image: ${RHYTHMA_REGISTRY}/exporter:${RHYTHMA_VERSION}
+        restart: unless-stopped
+        environment:
+            DATABASE_URL: postgres://rhythma:${POSTGRES_PASSWORD}@postgres:5432/rhythma
+            PORT: 3003
+            S3_ENDPOINT: http://minio:9000
+            S3_BUCKET: rhythma-exports
+            S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+            S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+        depends_on:
+            postgres:
+                condition: service_healthy
+            minio:
+                condition: service_healthy
+
+    proxy:
+        image: ${RHYTHMA_REGISTRY}/proxy:${RHYTHMA_VERSION}
+        restart: unless-stopped
+        ports:
+            # Loopback by default: whatever terminates TLS runs on this machine and forwards
+            # here, and nothing reaches this port from outside unless that proxy lets it.
+            #
+            # `RHYTHMA_BIND` exists because that default is wrong for the operator whose proxy
+            # is itself a container — nginx-proxy-manager, Traefik, Caddy in Docker — which
+            # reaches the host at a bridge address and not at loopback. Widening it to
+            # `0.0.0.0` publishes an Instance with no TLS in front of it, so it stays a
+            # deliberate edit in `.env` rather than a guess made here.
+            - '${RHYTHMA_BIND:-127.0.0.1}:${RHYTHMA_PORT}:80'
+        depends_on:
+            api:
+                condition: service_healthy
+            realtime:
+                condition: service_started
+
+volumes:
+    # Not under ./data with the database and the exports: this is a copy of something the
+    # registry already has, replaced wholesale by the next `rhythma update` and rebuilt from
+    # the image if it is ever lost. Nothing here is anybody's data.
+    wear-apk:

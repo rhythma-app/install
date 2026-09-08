@@ -1,0 +1,223 @@
+#!/bin/sh
+# The verbs an operator needs. Everything here is `docker compose` in the install
+# directory; nothing is clever, so anyone who knows compose can do the same by hand.
+set -eu
+
+INSTALL_DIR="${RHYTHMA_DIR:-/opt/rhythma}"
+RELEASES="${RHYTHMA_RELEASES:-https://rhythma-app.github.io/install}"
+# Where `install.sh` writes this script. Named here so `uninstall` can remove the command
+# along with everything else it installed; the two files are fetched separately and have no
+# way to share the constant.
+CLI_PATH="/usr/local/bin/rhythma"
+
+die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+
+usage() {
+    cat <<'USAGE'
+rhythma — manage the Rhythma Instance on this machine
+
+usage: rhythma <command>
+
+  start      Start the Instance.
+  stop       Stop it. Nothing is deleted and no data is lost; "start" brings it back.
+  restart    Stop, then start. This is what to run after editing .env.
+  update     Move to the newest published release.
+  logs       Follow the logs of every service, or of one: "rhythma logs api".
+  wipe       Delete every reading, device and account, keeping the configuration.
+  uninstall  Remove the Instance, its data and this command from the machine.
+
+Three of these cannot be undone, and none of them warns twice:
+
+  update     Each version applies its own migrations on start and there is no
+             downgrade. Snapshot the machine first.
+  wipe       There is no backup unless you took one.
+  uninstall  Deletes the readings, the accounts, the configuration and the key.
+
+The Instance lives in /opt/rhythma: "data" holds the database and the exports, and
+".env" holds the configuration. Edit a value there and run "rhythma restart".
+USAGE
+}
+
+# Before the install check, so an operator can read this on a machine where the Instance is
+# gone or was never there.
+case "${1:-}" in
+    help | -h | --help)
+        usage
+        exit 0
+        ;;
+    '')
+        usage >&2
+        exit 2
+        ;;
+esac
+
+[ -f "$INSTALL_DIR/.env" ] || die "no Instance installed in $INSTALL_DIR"
+cd "$INSTALL_DIR"
+# shellcheck disable=SC1091
+. ./.env
+
+confirm_url() {
+    printf 'Type the Instance URL to confirm (%s): ' "$RHYTHMA_URL"
+    read -r typed < /dev/tty
+    [ "$typed" = "$RHYTHMA_URL" ] || die "that did not match — nothing was deleted"
+}
+
+# Write a variable into `.env`, whether or not it is already there.
+#
+# `sed` alone silently does nothing when the line is absent, which is exactly the case that
+# matters: an Instance installed before a variable existed has an `.env` without it, and an
+# update that "wrote" it would leave compose interpolating an empty string. `api` then refuses
+# to start, on a machine that was working a minute earlier.
+set_env() {
+    if grep -q "^$1=" .env; then
+        sed -i "s|^$1=.*|$1=$2|" .env
+    else
+        printf '%s=%s\n' "$1" "$2" >> .env
+    fi
+}
+
+case "$1" in
+    start)   docker compose up -d ;;
+    stop)    docker compose down ;;
+    restart) docker compose down && docker compose up -d ;;
+    logs)    shift; docker compose logs --tail 200 -f "$@" ;;
+
+    update)
+        LATEST=$(curl -fsSL "$RELEASES/VERSION") || die "cannot reach $RELEASES"
+        if [ "$LATEST" = "$RHYTHMA_VERSION" ]; then
+            printf 'Already on %s.\n' "$RHYTHMA_VERSION"
+            exit 0
+        fi
+
+        printf 'Updating %s → %s\n' "$RHYTHMA_VERSION" "$LATEST"
+
+        # Which builds that release puts on a watch (ADR-0016). Fetched before anything is
+        # changed, because an update that moved the images and not these would leave `api`
+        # naming the previous release's app to every watch it manages.
+        curl -fsSL "$RELEASES/$LATEST/builds.env" -o builds.env \
+            || die "cannot fetch the builds for $LATEST"
+        LATEST_APP=$(sed -n 's/^WEAR_APP_VERSION=//p' builds.env)
+        LATEST_AGENT=$(sed -n 's/^FLEET_AGENT_VERSION=//p' builds.env)
+        [ -n "$LATEST_APP" ] && [ -n "$LATEST_AGENT" ] \
+            || die "the builds published for $LATEST do not name both watch builds"
+
+        # What this does to the watches, said before it happens.
+        #
+        # An update moves the fleet: every managed watch that is not pinned converges on the
+        # new version within a check-in interval, on its own, deliberately — a release that
+        # bumps the protocol locks every watch in the field out at once, and a fleet that
+        # waited for somebody to remember a second command would stay dark until they did.
+        #
+        # Truth on screen, not a gate. It is also entirely optional: an Instance whose
+        # database is stopped, or which has no watches at all, prints nothing and updates
+        # exactly the same.
+        #
+        # NOT E2E COVERED: this script. It runs on an installed Instance against a published
+        # release, which no suite in this repository has — the release workflow's `verify` job
+        # boots the published compose file, and stops short of the CLI. The query is written to
+        # fail into silence for exactly that reason: it is diagnostics printed before anything
+        # is changed, and it must never be the thing that stops an update.
+        # Against the app this release ships, never against the release itself. They differ
+        # whenever the watch sources did not change (ADR-0016), and comparing the release
+        # version would report a fleet-wide move on an update that touches no watch at all.
+        FLEET=$(docker compose exec -T postgres psql -U rhythma -d rhythma -tAc \
+            "SELECT count(*) FILTER (
+                     WHERE coalesce(desired_app_version, '${LATEST_APP}') = '${LATEST_APP}'
+                       AND app_version IS DISTINCT FROM '${LATEST_APP}'),
+                    count(*) FILTER (
+                     WHERE desired_app_version IS NOT NULL
+                       AND desired_app_version <> '${LATEST_APP}')
+             FROM watches WHERE retired_at IS NULL" 2>/dev/null) || FLEET=''
+
+        if [ -n "$FLEET" ]; then
+            MOVING=${FLEET%%|*}
+            PINNED=${FLEET##*|}
+            [ "$MOVING" = "0" ] || printf 'This will move %s watches to %s.\n' "$MOVING" "$LATEST"
+            [ "$PINNED" = "0" ] || printf '%s watches are pinned elsewhere and will not move.\n' "$PINNED"
+        fi
+
+        # The licence is the registry credential (ADR-0011, as amended). A refusal here is the
+        # single mechanism by which a lapsed arrangement means anything, and it means exactly
+        # one thing: no more updates. Everything already on this machine keeps running.
+        printf '%s' "$RHYTHMA_LICENCE" \
+            | docker login "$RHYTHMA_REGISTRY" --username rhythma --password-stdin >/dev/null \
+            || die "the stored licence was refused — your subscription may have lapsed"
+
+        # The compose file comes from the release too: a new version may add a service, and
+        # one frozen at install time cannot start it.
+        curl -fsSL "$RELEASES/$LATEST/docker-compose.yml" -o docker-compose.yml \
+            || die "cannot fetch the compose file for $LATEST"
+
+        set_env RHYTHMA_VERSION "$LATEST"
+        set_env WEAR_APP_VERSION "$LATEST_APP"
+        set_env FLEET_AGENT_VERSION "$LATEST_AGENT"
+        # Not `--quiet`, for the same reason the installer is not: a pull that prints nothing
+        # for several minutes is one an operator kills half-finished.
+        docker compose pull
+        docker compose up -d
+        printf 'Now on %s (app %s, agent %s).\n' "$LATEST" "$LATEST_APP" "$LATEST_AGENT"
+        ;;
+
+    wipe)
+        printf 'This deletes every reading, device and account in this Instance.\n'
+        printf 'The configuration in .env is kept.\n\n'
+        confirm_url
+
+        docker compose down
+        rm -rf ./data/postgres ./data/minio
+        mkdir -p ./data/postgres ./data/minio
+        printf 'Wiped. Run "rhythma start" for a fresh Instance.\n'
+        ;;
+
+    uninstall)
+        printf 'This removes Rhythma from this machine entirely:\n\n'
+        printf '  every reading, device and account\n'
+        printf '  the configuration and the registry key in %s/.env\n' "$INSTALL_DIR"
+        printf '  the images, the containers and their volumes\n'
+        printf '  the "rhythma" command itself\n\n'
+        printf 'It is not "wipe": there is no Instance left afterwards, and no key to install\n'
+        printf 'a new one with unless you kept a copy.\n\n'
+        confirm_url
+
+        # The images are most of what Rhythma occupies on disk, and `--rmi all` alone does not
+        # get them. A pulled image carries two references — the tag the compose file names and
+        # the digest it was fetched by — and `--rmi all` removes only the tag, so the image
+        # survives untagged at full size. Observed: three of six were left behind as `<none>`,
+        # 357 MB, on a machine reporting a successful uninstall.
+        #
+        # Removing by ID drops every reference at once. The IDs have to be read while the
+        # containers still exist, which is why this runs first, and `docker compose images`
+        # can only name images belonging to this project's own containers — so nothing else on
+        # the machine is in reach. Unforced on purpose: if something else has since started
+        # using one, the right outcome is to leave it.
+        IMAGES=$(docker compose images -q 2>/dev/null | sort -u || true)
+
+        docker compose down --volumes --remove-orphans --rmi all || true
+
+        for image in $IMAGES; do
+            docker rmi "$image" >/dev/null 2>&1 || true
+        done
+
+        # The licence is stored in Docker's own credential file, not only in .env. An uninstall
+        # that leaves it behind leaves a working pull credential on a machine that has no
+        # Rhythma.
+        docker logout "$RHYTHMA_REGISTRY" >/dev/null 2>&1 || true
+
+        # Out of the directory before deleting it.
+        cd /
+        rm -rf "$INSTALL_DIR"
+
+        printf 'Rhythma is uninstalled.\n'
+
+        # Last, and deliberately: the shell is running this file, so removing it now is safe
+        # — the inode outlives the unlink — while removing it earlier would leave the command
+        # gone if anything above failed.
+        rm -f "$CLI_PATH"
+        ;;
+
+    *)
+        printf 'unknown command: %s\n\n' "$1" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
