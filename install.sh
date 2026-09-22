@@ -119,10 +119,16 @@ else
 # Written by the installer. Edit a value and run 'rhythma restart'.
 RHYTHMA_URL=$RHYTHMA_URL
 RHYTHMA_PORT=$RHYTHMA_PORT
-# Which address the port is published on. Loopback is right when TLS is terminated by
+# Where network sensors report. A second published port, because a datagram carries no
+# hostname and no path and so cannot be routed behind the web one (ADR-0018). Nothing reaches
+# it until a sensor is added, and an Instance that has none never needs it open.
+RHYTHMA_INGEST_PORT=3190
+# Which address both ports are published on. Loopback is right when TLS is terminated by
 # something running on this machine. Change it to the docker bridge address (usually
 # 172.17.0.1) if your reverse proxy is itself a container, and to 0.0.0.0 only if you
-# genuinely mean to publish an Instance with nothing in front of it.
+# genuinely mean to publish an Instance with nothing in front of it — which for the ingest
+# port also means plaintext readings on the public internet, because the sensors that report
+# there cannot do TLS.
 RHYTHMA_BIND=127.0.0.1
 RHYTHMA_VERSION=
 # Which watch builds that release ships. Not the same string: a watch build moves only when its

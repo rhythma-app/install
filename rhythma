@@ -18,6 +18,7 @@ rhythma — manage the Rhythma Instance on this machine
 
 usage: rhythma <command>
 
+  version    Say what this machine is running, and whether anything newer exists.
   start      Start the Instance.
   stop       Stop it. Nothing is deleted and no data is lost; "start" brings it back.
   restart    Stop, then start. This is what to run after editing .env.
@@ -77,6 +78,29 @@ set_env() {
 }
 
 case "$1" in
+    # The first question anybody asks, and the first one asked *of* an operator when something
+    # is wrong. It reads `.env` and nothing else, so it answers on an Instance that is stopped,
+    # broken, or halfway through an update that failed.
+    #
+    # The three numbers rather than one: a release is an assembly and its parts move apart
+    # (ADR-0016), so "what are my watches on" is not answerable from the release id. `.env` is
+    # where `install.sh` and `update` write all three, and it is what `api` interpolates from,
+    # so this reports the same values the Instance is actually running on.
+    version)
+        printf 'rhythma %s\n' "$RHYTHMA_VERSION"
+        printf '  watch app     %s\n' "${WEAR_APP_VERSION:-unknown}"
+        printf '  fleet agent   %s\n' "${FLEET_AGENT_VERSION:-unknown}"
+        printf '  installed in  %s\n' "$INSTALL_DIR"
+
+        # Whether anything newer exists, best-effort. An operator running this because the
+        # machine is offline must still get the four lines above, so a failure here prints
+        # nothing at all rather than an error about a network they already know about.
+        LATEST=$(curl -fsSL --max-time 5 "$RELEASES/VERSION" 2>/dev/null) || LATEST=''
+        if [ -n "$LATEST" ] && [ "$LATEST" != "$RHYTHMA_VERSION" ]; then
+            printf '\n%s is published. Run "rhythma update" to move to it.\n' "$LATEST"
+        fi
+        ;;
+
     start)   docker compose up -d ;;
     stop)    docker compose down ;;
     restart) docker compose down && docker compose up -d ;;
