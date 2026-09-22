@@ -96,7 +96,6 @@ if [ -f .env ]; then
     # Values this Instance predates. Appended rather than rewritten: everything else in here is
     # the operator's, including any edit they made deliberately.
     grep -q '^RHYTHMA_REGISTRY=' .env || printf 'RHYTHMA_REGISTRY=%s\n' "$REGISTRY" >> .env
-    grep -q '^RHYTHMA_LICENCE=' .env || printf 'RHYTHMA_LICENCE=%s\n' "$KEY" >> .env
     grep -q '^RELEASE_SERVICE_URL=' .env || printf 'RELEASE_SERVICE_URL=https://%s\n' "$REGISTRY" >> .env
 else
     say ""
@@ -186,6 +185,11 @@ APP_VERSION=$(sed -n 's/^WEAR_APP_VERSION=//p' builds.env)
 AGENT_VERSION=$(sed -n 's/^FLEET_AGENT_VERSION=//p' builds.env)
 [ -n "$APP_VERSION" ] && [ -n "$AGENT_VERSION" ] \
     || die "$RELEASES/$VERSION/builds.env does not name both watch builds"
+# The key this run signed in with, always, even over one already here. It is the one that just
+# pulled the images, so it is the one this Instance holds: an update given a new licence used to
+# keep the old one in `.env`, pull with the new and ask the release service with the old — which
+# answered that it no longer knew this Instance, on a machine whose every pull was succeeding.
+set_env RHYTHMA_LICENCE "$KEY"
 set_env WEAR_APP_VERSION "$APP_VERSION"
 set_env FLEET_AGENT_VERSION "$AGENT_VERSION"
 
