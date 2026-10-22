@@ -178,7 +178,9 @@ case "$1" in
         # Not `--quiet`, for the same reason the installer is not: a pull that prints nothing
         # for several minutes is one an operator kills half-finished.
         docker compose pull
-        docker compose up -d
+        # A version may also drop or rename a service, and its old container would otherwise
+        # keep running beside its replacement, unmanaged by a file that no longer names it.
+        docker compose up -d --remove-orphans
         printf 'Now on %s (app %s, agent %s).\n' "$LATEST" "$LATEST_APP" "$LATEST_AGENT"
         ;;
 
@@ -188,8 +190,10 @@ case "$1" in
         confirm_url
 
         docker compose down
-        rm -rf ./data/postgres ./data/minio
-        mkdir -p ./data/postgres ./data/minio
+        # `./data/minio` too: an Instance installed before `docs/adr/0007` moved the bucket to
+        # `./data/s3` still has its old exports there, and a wipe is of everything.
+        rm -rf ./data/postgres ./data/s3 ./data/minio
+        mkdir -p ./data/postgres ./data/s3
         printf 'Wiped. Run "rhythma start" for a fresh Instance.\n'
         ;;
 

@@ -75,7 +75,7 @@ REGISTRY=$(curl -fsSL "$RELEASES/REGISTRY") || die "cannot reach $RELEASES"
 [ -n "$REGISTRY" ] || die "$RELEASES/REGISTRY is empty"
 
 # ----------------------------------------------------------------- the URL --
-mkdir -p "$INSTALL_DIR/data/postgres" "$INSTALL_DIR/data/minio"
+mkdir -p "$INSTALL_DIR/data/postgres" "$INSTALL_DIR/data/s3"
 
 # Stated, not inherited from whatever umask the operator's root shell has. Postgres 18's
 # entrypoint re-execs as the `postgres` user and has to traverse this directory to reach the
@@ -85,7 +85,7 @@ mkdir -p "$INSTALL_DIR/data/postgres" "$INSTALL_DIR/data/minio"
 # "mkdir: can't create directory '/var/lib/postgresql/18/': Permission denied". Observed on a
 # real host. Nothing secret lives at this level: `.env` is written under `umask 077` below and
 # the data directory Postgres creates inside this one is 0700 and its own.
-chmod 755 "$INSTALL_DIR" "$INSTALL_DIR/data" "$INSTALL_DIR/data/postgres" "$INSTALL_DIR/data/minio"
+chmod 755 "$INSTALL_DIR" "$INSTALL_DIR/data" "$INSTALL_DIR/data/postgres" "$INSTALL_DIR/data/s3"
 
 cd "$INSTALL_DIR"
 
